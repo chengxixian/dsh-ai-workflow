@@ -109,3 +109,30 @@ They cover graph normalisation and topology, per-node context isolation, the exc
 ## License
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).
+## Canvas controls
+
+| Action | How |
+|---|---|
+| Pan | drag the empty canvas |
+| Zoom | mouse wheel (anchored at the pointer) |
+| Move a node | drag its header |
+| Edit a node | right-click it |
+| Wire nodes | drag from one port to another port |
+| Delete a connection | right-click the line → **Delete connection** |
+| Undo / Redo | **Undo** / **Redo** in the toolbar, or Ctrl+Z / Ctrl+Shift+Z while the canvas has focus |
+| Delete a node | select it, press Delete (canvas focused) |
+| Frame the whole graph | **Fit** |
+| Copy the graph out | **Export** (writes JSON to the clipboard) |
+| Paste a graph in | **Import** (replaces this conversation's graph) |
+
+### Team briefs
+
+A leader hands every member the same task. Each model node can also carry a
+**team brief** — the slice of the job that belongs to that member alone — so
+"writer" and "illustrator" receive the same request but different instructions.
+The brief is re-read on every run, like the node prompt.
+
+### ComfyUI progress
+
+While a graph runs, the ComfyUI node polls the server's queue and shows
+`queue 3/7 · executing` with a progress bar instead of an endless spinner.

@@ -205,6 +205,9 @@ export function normalizeWorkflow(input) {
       temperature: Number.isFinite(Number(raw.temperature)) ? Math.max(0, Math.min(2, Number(raw.temperature))) : undefined,
       maxTokens: Number.isFinite(Number(raw.maxTokens)) ? Math.max(1, Math.min(400_000, Number(raw.maxTokens))) : undefined,
       prompt: typeof raw.prompt === 'string' ? raw.prompt.slice(0, MAX_PROMPT_CHARS) : '',
+      // Leader → member brief: what this member is responsible for when the
+      // whole team gets the same user message.
+      dispatchHint: typeof raw.dispatchHint === 'string' ? raw.dispatchHint.slice(0, 4000) : '',
       tools: strings(raw.tools),
       skills: strings(raw.skills),
       mcps: strings(raw.mcps),
@@ -403,6 +406,14 @@ export function buildSystemPrompt(node, parts = {}) {
   const lines = []
   const prompt = String(node.prompt ?? '').trim()
   lines.push(prompt === '' ? '你是一个独立的工作流节点。只完成本节点被分配的任务，输出可直接交给下游使用的结果。' : prompt)
+  const hint = String(node.dispatchHint ?? '').trim()
+  if (hint !== '') {
+    // The leader may hand every member the same task text; this is the slice of
+    // the job that belongs to *this* member only.
+    lines.push('')
+    lines.push('【你在团队里的分工】')
+    lines.push(hint)
+  }
   lines.push('')
   lines.push('【工作方式】')
   lines.push('- 你只看到本节点收到的输入和你自己的历史；其他节点的工作区与你隔离。')
@@ -847,6 +858,45 @@ export async function comfyInputTargets(name) {
 export async function mergeComfyWorkflow(name, node) {
   const { graph } = await loadComfyGraph(name)
   return applyComfyParams(structuredClone(graph), node)
+}
+
+/**
+ * Read ComfyUI's queue so the card can show progress instead of a spinner.
+ * @param baseUrl - server origin.
+ * @param fetchImpl - injectable fetch, for tests.
+ * @returns `{ ok, running, done, total, node?, error? }`.
+ */
+export async function comfyProgress(baseUrl, fetchImpl = fetch) {
+  const origin = String(baseUrl ?? '').replace(/\/$/, '')
+  try {
+    const [queueResponse, historyResponse] = await Promise.all([
+      fetchImpl(`${origin}/queue`, { signal: AbortSignal.timeout(4000) }),
+      fetchImpl(`${origin}/history?max_items=8`, { signal: AbortSignal.timeout(4000) }),
+    ])
+    if (!queueResponse.ok) return { ok: false, running: 0, done: 0, total: 0, error: `HTTP ${queueResponse.status}` }
+    const queue = await queueResponse.json()
+    const history = historyResponse.ok ? await historyResponse.json() : {}
+    const running = Array.isArray(queue?.queue_running) ? queue.queue_running.length : 0
+    const pending = Array.isArray(queue?.queue_pending) ? queue.queue_pending.length : 0
+    // ComfyUI records one history entry per finished prompt.
+    const finished = history !== null && typeof history === 'object' ? Object.keys(history).length : 0
+    const current = Array.isArray(queue?.queue_running) ? queue.queue_running[0] : undefined
+    // queue_running entries look like [number, promptId, graph, extra, outputs].
+    const graph = Array.isArray(current) ? current[2] : undefined
+    const node = graph !== null && typeof graph === 'object'
+      ? String(graph?.extra_pnginfo?.workflow?.nodes?.[0]?.type ?? '')
+      : ''
+    return {
+      ok: true,
+      running: running + pending,
+      done: Math.max(0, finished),
+      total: finished + running + pending,
+      executing: running > 0,
+      node,
+    }
+  } catch (error) {
+    return { ok: false, running: 0, done: 0, total: 0, error: String(error?.message ?? error) }
+  }
 }
 
 /**
@@ -2025,6 +2075,9 @@ export function registerWorkflowRoutes(ctx) {
     { path: `${ROUTE_PREFIX}/comfy/view`, methods: ['GET'], fetch: (request) => serveComfyView(request) },
     { path: `${ROUTE_PREFIX}/chat/input`, methods: ['GET'], fetch: (request) => serveChatInput(ctx, request) },
     { path: `${ROUTE_PREFIX}/chat/reply`, methods: ['POST'], fetch: (request) => serveChatReply(ctx, request) },
+    { path: `${ROUTE_PREFIX}/graph/export`, methods: ['GET'], fetch: (request) => serveGraphExport(ctx, request) },
+    { path: `${ROUTE_PREFIX}/graph/import`, methods: ['POST'], fetch: (request) => serveGraphImport(ctx, request) },
+    { path: `${ROUTE_PREFIX}/comfy/progress`, methods: ['GET'], fetch: (request) => serveComfyProgress(request) },
   ]
   for (const route of routes) {
     ctx.effect(
@@ -2178,6 +2231,17 @@ async function serveComfyStatus(ctx, request) {
   const url = new URL(request.url, 'http://localhost')
   const baseUrl = url.searchParams.get('baseUrl') || `http://127.0.0.1:${COMFY_PORT}`
   return json({ ok: true, ...await comfyStatus(baseUrl) })
+}
+
+/**
+ * Queue progress for one ComfyUI server.
+ * @param request - GET with baseUrl.
+ * @returns the progress snapshot.
+ */
+async function serveComfyProgress(request) {
+  const url = new URL(request.url, 'http://localhost')
+  const baseUrl = url.searchParams.get('baseUrl') || `http://127.0.0.1:${COMFY_PORT}`
+  return json(await comfyProgress(baseUrl))
 }
 
 /**
@@ -2367,6 +2431,59 @@ async function serveChatReply(ctx, request) {
   if (input === undefined) return json({ ok: false, error: 'bad-body' }, 400)
   const receipt = publishToChat(ctx, input.sessionId, input.text, Array.isArray(input.images) ? input.images : [])
   return json({ ok: receipt.ok === true, ...receipt })
+}
+
+/**
+ * Export the saved graph as the same JSON the file holds, so it can be copied
+ * out of one conversation and pasted into another.
+ * @param ctx - Host context.
+ * @param request - GET with sessionId.
+ * @returns `{ ok, workflow }`.
+ */
+async function serveGraphExport(ctx, request) {
+  const url = new URL(request.url, 'http://localhost')
+  const sessionId = url.searchParams.get('sessionId') ?? ''
+  if (sessionId === '') return json({ ok: false, error: 'bad-session' }, 400)
+  const file = join(workflowDirOf(ctx, sessionId), 'main.json')
+  try {
+    const raw = await readFile(file, 'utf8')
+    return json({ ok: true, workflow: normalizeWorkflow(JSON.parse(raw)) })
+  } catch {
+    return json({ ok: true, workflow: emptyWorkflow() })
+  }
+}
+
+/**
+ * Accept an exported graph and make it this conversation's graph.
+ * @param ctx - Host context.
+ * @param request - POST `{ sessionId, workflow }`.
+ * @returns `{ ok, workflow, nodes, edges }`.
+ */
+async function serveGraphImport(ctx, request) {
+  const input = await readJson(request)
+  if (input === undefined || typeof input.sessionId !== 'string' || input.sessionId === '') {
+    return json({ ok: false, error: 'bad-body' }, 400)
+  }
+  return json(await importWorkflow(ctx, input.sessionId, input.workflow))
+}
+
+/**
+ * Write one graph into a conversation's folder, normalised.
+ * @param ctx - Host context.
+ * @param sessionId - target conversation.
+ * @param input - candidate graph.
+ * @returns `{ ok, workflow, nodes, edges }`.
+ */
+export async function importWorkflow(ctx, sessionId, input) {
+  const workflow = normalizeWorkflow(input)
+  const folder = workflowDirOf(ctx, sessionId)
+  if (folder?.dir === undefined) {
+    // An unknown session must not write into the workspace root by accident.
+    return { ok: false, error: folder?.error ?? 'unknown-session', message: folder?.message ?? '', workflow }
+  }
+  await mkdir(folder.dir, { recursive: true })
+  await writeFile(join(folder.dir, 'main.json'), JSON.stringify(workflow, null, 2), 'utf8')
+  return { ok: true, workflow, nodes: workflow.nodes.length, edges: workflow.edges.length }
 }
 
 /**

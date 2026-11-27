@@ -111,6 +111,21 @@ window.__ModuleLoader__.load({
       "wfExpand": "Expand graph",
       "wfNoNegative": "This workflow has no negative-prompt input",
       "wfPreview": "Preview submit",
+      "wfFit": "Fit",
+      "wfFitHint": "Frame every node in the canvas",
+      "wfUndo": "Undo",
+      "wfUndoHint": "Undo the last graph edit (Ctrl+Z)",
+      "wfRedo": "Redo",
+      "wfRedoHint": "Redo the undone edit (Ctrl+Shift+Z)",
+      "wfExport": "Export",
+      "wfExportHint": "Copy this graph to the clipboard as JSON",
+      "wfImport": "Import",
+      "wfImportHint": "Replace this graph with the JSON on the clipboard",
+      "wfExported": "Graph copied to the clipboard",
+      "wfImported": "Graph imported",
+      "wfDispatchHint": "Team brief",
+      "wfDispatchHintHint": "What this member owns when the leader hands the whole team the same task",
+      "wfProgress": "queue",
       "wfHelp": "Help",
       "wfHelpHint": "Drag from one port to another to wire nodes, right-click a connection to delete it, right-click a node to edit it."
     }
@@ -204,6 +219,21 @@ window.__ModuleLoader__.load({
       "wfExpand": "展开节点图",
       "wfNoNegative": "该工作流没有负向提示词输入",
       "wfPreview": "预览提交",
+      "wfFit": "适应",
+      "wfFitHint": "把整张图收进视野",
+      "wfUndo": "撤销",
+      "wfUndoHint": "撤销上一次改动（Ctrl+Z）",
+      "wfRedo": "重做",
+      "wfRedoHint": "重做被撤销的改动（Ctrl+Shift+Z）",
+      "wfExport": "导出",
+      "wfExportHint": "把当前图复制成 JSON 放到剪贴板",
+      "wfImport": "导入",
+      "wfImportHint": "用剪贴板里的 JSON 替换当前图",
+      "wfExported": "图已复制到剪贴板",
+      "wfImported": "图已导入",
+      "wfDispatchHint": "派单说明",
+      "wfDispatchHintHint": "Leader 把同一条任务发给全队时，这个成员具体负责哪部分",
+      "wfProgress": "队列",
       "wfHelp": "帮助",
       "wfHelpHint": "从一个端口拖到另一个端口即连线，右键点连线可删除，右键点节点可编辑。"
     }
@@ -828,6 +858,10 @@ function clipToWidth(ctx, text, max) {
 .dsh-wf-modal-card{width:100%;max-height:88%;display:flex;flex-direction:column;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l1);border-radius:14px;overflow:hidden;box-shadow:0 20px 50px rgba(0,0,0,.45)}
 .dsh-wf-modal-head{display:flex;align-items:center;gap:6px;padding:8px 10px;border-bottom:1px solid var(--dsw-alias-border-l1);flex:none}
 .dsh-wf-modal-title{font-weight:600;font-size:12px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dsh-wf-progress{display:flex;flex-direction:column;gap:3px;margin:4px 0 2px}
+.dsh-wf-progress-track{height:4px;border-radius:2px;background:var(--dsw-alias-border-l1);overflow:hidden}
+.dsh-wf-progress-fill{height:100%;border-radius:2px;background:var(--dsw-alias-state-accent-primary,#4a6cf7);transition:width .4s}
+.dsh-wf-progress-text{font-size:10px;color:var(--dsw-alias-label-secondary)}
 .dsh-wf-menu{position:absolute;z-index:20;display:flex;flex-direction:column;gap:4px;padding:6px;min-width:150px;max-width:240px;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l1);border-radius:10px;box-shadow:0 10px 26px rgba(0,0,0,.32)}
 .dsh-wf-menu-title{font-size:10px;color:var(--dsw-alias-label-secondary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding:0 4px 2px}
 .dsh-wf-lite{display:block;width:100%;height:100%;max-height:100%;border-radius:10px;border:1px solid var(--dsw-alias-border-l1);background:#14161a}
@@ -861,7 +895,46 @@ function clipToWidth(ctx, text, max) {
     function WorkflowPanel(props) {
       const { t, ctx } = props
       const sessionId = props.sessionId || props.session?.id || props.session?.sessionId || ''
-      const [workflow, setWorkflow] = React.useState(null)
+      const [workflow, setWorkflowState] = React.useState(null)
+      /** Undo / redo stacks of graph snapshots; runtime-only, never saved. */
+      const historyRef = React.useRef({ past: [], future: [] })
+      const [historyTick, setHistoryTick] = React.useState(0)
+      /**
+       * Apply a graph change and remember the previous graph.
+       * @param {object|Function} next - next graph or updater.
+       * @param {boolean} record - false for loads, run merges and reloads.
+       */
+      const setWorkflow = (next, record = true) => {
+        const current = workflowRef.current
+        const value = typeof next === 'function' ? next(current) : next
+        if (record && current !== null) {
+          const past = historyRef.current.past
+          past.push(current)
+          if (past.length > 60) past.shift()
+          historyRef.current.future = []
+          setHistoryTick(tick => tick + 1)
+        }
+        workflowRef.current = value
+        setWorkflowState(value)
+      }
+      const undo = () => {
+        const stack = historyRef.current
+        const previous = stack.past.pop()
+        if (previous === undefined) return
+        if (workflowRef.current !== null) stack.future.push(workflowRef.current)
+        workflowRef.current = previous
+        setWorkflowState(previous)
+        setHistoryTick(tick => tick + 1)
+      }
+      const redo = () => {
+        const stack = historyRef.current
+        const next = stack.future.pop()
+        if (next === undefined) return
+        if (workflowRef.current !== null) stack.past.push(workflowRef.current)
+        workflowRef.current = next
+        setWorkflowState(next)
+        setHistoryTick(tick => tick + 1)
+      }
       const [catalog, setCatalog] = React.useState({ providers: [], models: [], tools: [], skills: [], mcps: [] })
       const [selected, setSelected] = React.useState('')
       const [error, setError] = React.useState('')
@@ -881,10 +954,16 @@ function clipToWidth(ctx, text, max) {
       const [targets, setTargets] = React.useState({})
       const [nodeLib, setNodeLib] = React.useState({ open: false, data: null, error: '', query: '' })
       const [comfyRaw, setComfyRaw] = React.useState({})
+      /** ComfyUI queue snapshot: `{ ok, running, done, total, executing }`. */
+      const [comfyProgress, setComfyProgress] = React.useState(null)
       /** Right-clicked connection: `{ id, x, y, label }` or null. */
       const [edgeMenu, setEdgeMenu] = React.useState(null)
 
       const canvasRef = React.useRef(null)
+      /** The panel root: focus target for the canvas shortcuts. */
+      const rootRef = React.useRef(null)
+      /** True while the pointer is over the panel: scopes the shortcuts. */
+      const panelHover = React.useRef(false)
       const viewRef = React.useRef(view)
       viewRef.current = view
       const savedRef = React.useRef('')
@@ -897,14 +976,14 @@ function clipToWidth(ctx, text, max) {
       React.useEffect(() => {
         let alive = true
         if (sessionId === '') {
-          setWorkflow({ version: 1, id: 'main', title: 'AI 工作流', nodes: [], edges: [] })
+          setWorkflow({ version: 1, id: 'main', title: 'AI 工作流', nodes: [], edges: [] }, false)
           return () => { alive = false }
         }
         void (async () => {
           try {
             const data = await wfCall('load', { query: { sessionId } })
             if (!alive) return
-            setWorkflow(data.workflow)
+            setWorkflow(data.workflow, false)
             savedRef.current = JSON.stringify({ title: data.workflow.title, nodes: data.workflow.nodes.map(wfPersisted), edges: data.workflow.edges })
             if (data.source === 'new') setNotice(t('wfEmpty'))
           } catch (caught) {
@@ -1074,6 +1153,63 @@ function clipToWidth(ctx, text, max) {
         }))
       }
 
+      // While a graph runs, ask ComfyUI how far its queue has got: a spinner
+      // hides whether the job is stuck behind six other prompts.
+      const comfyBusy = (workflow?.nodes ?? []).some(node => node.type === 'comfy' && node.status === 'running')
+      React.useEffect(() => {
+        if (comfyBusy !== true) {
+          setComfyProgress(null)
+          return undefined
+        }
+        let cancelled = false
+        const tick = async () => {
+          const node = (workflow?.nodes ?? []).find(item => item.type === 'comfy')
+          try {
+            const data = await wfCall('comfy/progress', { query: { baseUrl: node?.baseUrl ?? '' } })
+            if (!cancelled) setComfyProgress(data)
+          } catch {
+            if (!cancelled) setComfyProgress(null)
+          }
+        }
+        void tick()
+        const timer = setInterval(() => void tick(), 1200)
+        return () => {
+          cancelled = true
+          clearInterval(timer)
+        }
+      }, [comfyBusy, sessionId, workflow?.nodes])
+
+      React.useEffect(() => {
+        const onKey = (event) => {
+          if (event.defaultPrevented) return
+          const target = event.target
+          const typing = target instanceof HTMLElement
+            && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)
+          if (typing) return
+          const meta = event.ctrlKey || event.metaKey
+          if (meta && event.key.toLowerCase() === 'z') {
+            event.preventDefault()
+            if (event.shiftKey) redo()
+            else undo()
+            return
+          }
+          if (event.key === 'Escape') {
+            setEdgeMenu(null)
+            setEditing(undefined)
+            setSelected(undefined)
+            return
+          }
+          if (event.key === 'Delete' || event.key === 'Backspace') {
+            if (selected === undefined) return
+            event.preventDefault()
+            removeNode(selected)
+          }
+        }
+        // Capture phase: the chat shell also listens for Ctrl+Z on the bubble path.
+        document.addEventListener('keydown', onKey, true)
+        return () => document.removeEventListener('keydown', onKey, true)
+      })
+
       const addNode = (type) => {
         // The leader is the conversation itself, so exactly one may exist.
         if (type === 'leader' && (workflow?.nodes ?? []).some(node => node.type === 'leader')) {
@@ -1123,6 +1259,60 @@ function clipToWidth(ctx, text, max) {
         }
         setWorkflow(current => current === null ? current : ({ ...current, nodes: [...current.nodes, node] }))
         setSelected(id)
+      }
+
+      /**
+       * Frame every node: center the graph's bounding box in the canvas.
+       */
+      const fitView = () => {
+        const nodes = workflow?.nodes ?? []
+        const host = canvasRef.current
+        if (nodes.length === 0 || host === null) return
+        const minX = Math.min(...nodes.map(node => node.x))
+        const minY = Math.min(...nodes.map(node => node.y))
+        const maxX = Math.max(...nodes.map(node => node.x + WF_W))
+        const maxY = Math.max(...nodes.map(node => node.y + 260))
+        const padding = 60
+        const width = Math.max(1, maxX - minX + padding * 2)
+        const height = Math.max(1, maxY - minY + padding * 2)
+        const rect = host.getBoundingClientRect()
+        const k = Math.max(0.35, Math.min(1.2, Math.min(rect.width / width, rect.height / height)))
+        setView({
+          x: Math.round((rect.width - (maxX - minX) * k) / 2 - minX * k),
+          y: Math.round((rect.height - (maxY - minY) * k) / 2 - minY * k),
+          k,
+        })
+      }
+
+      /**
+       * Copy the saved graph to the clipboard as JSON.
+       */
+      const exportGraph = async () => {
+        try {
+          const data = await wfCall('graph/export', { query: { sessionId } })
+          const payload = JSON.stringify(data.workflow, null, 2)
+          await navigator.clipboard.writeText(payload)
+          setNotice(t('wfExported'))
+        } catch (error) {
+          setNotice(String(error?.message ?? error))
+        }
+      }
+
+      /**
+       * Replace this conversation's graph with the one on the clipboard.
+       */
+      const importGraph = async () => {
+        try {
+          const raw = await navigator.clipboard.readText()
+          const parsed = JSON.parse(raw)
+          const data = await wfCall('graph/import', { method: 'POST', body: { sessionId, workflow: parsed } })
+          if (data.ok !== true) throw new Error(data.message || data.error || 'import failed')
+          setWorkflow(data.workflow, false)
+          historyRef.current = { past: [], future: [] }
+          setNotice(t('wfImported'))
+        } catch (error) {
+          setNotice(String(error?.message ?? error))
+        }
       }
 
       const removeNode = (id) => {
@@ -1477,6 +1667,14 @@ function clipToWidth(ctx, text, max) {
                 onChange: event => patchNode(node.id, { prompt: event.target.value }),
               })),
               h('div', { className: 'dsh-wf-node-model' }, t('wfPromptHint')),
+              h(WfField, { label: t('wfDispatchHint') }, h('textarea', {
+                className: 'dsh-wf-area',
+                rows: 3,
+                value: node.dispatchHint ?? '',
+                placeholder: t('wfDispatchHintHint'),
+                onChange: event => patchNode(node.id, { dispatchHint: event.target.value }),
+              })),
+              h('div', { className: 'dsh-wf-node-model' }, t('wfDispatchHintHint')),
             )
             : null,
           node.type === 'exchange'
@@ -1912,6 +2110,19 @@ function clipToWidth(ctx, text, max) {
                 node.status === 'done' && node.ms > 0 ? h('span', { className: 'dsh-wf-badge' }, `${(node.ms / 1000).toFixed(1)}s`) : null,
               ),
               node.type === 'comfy' && comfyUi !== null ? miniGraph(comfyUi) : null,
+              node.type === 'comfy' && node.status === 'running' && comfyProgress !== null && comfyProgress.ok === true
+                ? h(
+                  'div',
+                  { className: 'dsh-wf-progress' },
+                  h('div', { className: 'dsh-wf-progress-track' }, h('div', {
+                    className: 'dsh-wf-progress-fill',
+                    style: {
+                      width: `${comfyProgress.total > 0 ? Math.round((comfyProgress.done / comfyProgress.total) * 100) : 0}%`,
+                    },
+                  })),
+                  h('span', { className: 'dsh-wf-progress-text' }, `${t('wfProgress')} ${comfyProgress.done}/${comfyProgress.total}${comfyProgress.executing === true ? ' · 执行中' : ''}`),
+                )
+                : null,
               node.error !== '' && node.error !== undefined
                 ? h('div', { className: 'dsh-wf-node-out', style: { color: 'var(--dsw-alias-state-error-primary)' } }, node.error)
                 : h('div', { className: 'dsh-wf-node-out' }, node.output === '' || node.output === undefined ? '—' : node.output.slice(0, 220)),
@@ -2132,7 +2343,33 @@ function clipToWidth(ctx, text, max) {
 
       return h(
         'div',
-        { className: 'dsh-wf-root', 'data-aiwf': 'panel' },
+        {
+          className: 'dsh-wf-root',
+          'data-aiwf': 'panel',
+          ref: rootRef,
+          tabIndex: -1,
+          onKeyDown: (event) => {
+            const meta = event.ctrlKey || event.metaKey
+            if (meta && event.key.toLowerCase() === 'z') {
+              event.preventDefault()
+              if (event.shiftKey) redo()
+              else undo()
+              return
+            }
+            if (event.key === 'Escape') {
+              setEdgeMenu(null)
+              setEditing(undefined)
+              setSelected(undefined)
+              return
+            }
+            if ((event.key === 'Delete' || event.key === 'Backspace') && selected !== undefined) {
+              event.preventDefault()
+              removeNode(selected)
+            }
+          },
+          onPointerEnter: () => { panelHover.current = true },
+          onPointerLeave: () => { panelHover.current = false },
+        },
         h('style', null, WF_CSS),
         h(
           'div',
@@ -2145,6 +2382,11 @@ function clipToWidth(ctx, text, max) {
           h(Button, { label: t('wfAddExchange'), onClick: () => addNode('exchange') }),
           h(Button, { label: t('wfAddComfy'), onClick: () => addNode('comfy') }),
           h(Button, { label: t('wfNodeLib'), onClick: () => void openNodeLib() }),
+          h(Button, { label: t('wfFit'), title: t('wfFitHint'), onClick: () => fitView() }),
+          h(Button, { label: t('wfUndo'), title: t('wfUndoHint'), disabled: historyRef.current.past.length === 0, onClick: () => undo() }),
+          h(Button, { label: t('wfRedo'), title: t('wfRedoHint'), disabled: historyRef.current.future.length === 0, onClick: () => redo() }),
+          h(Button, { label: t('wfExport'), title: t('wfExportHint'), onClick: () => void exportGraph() }),
+          h(Button, { label: t('wfImport'), title: t('wfImportHint'), onClick: () => void importGraph() }),
           h('span', { className: 'dsh-wf-sp' }),
           h(Button, { label: running ? t('wfStop') : t('wfRun'), tone: running ? 'danger' : 'primary', disabled: workflow === null || nodes.length === 0 || sessionId === '', onClick: () => { void (running ? stopRun() : startRun()) } }),
           h(Button, { label: t('wfHelp'), title: t('wfHelpHint'), onClick: () => setNotice(t('wfHelpHint')) }),
@@ -2160,6 +2402,9 @@ function clipToWidth(ctx, text, max) {
               className: 'dsh-wf-canvas',
               ref: canvasRef,
               onPointerDown: (event) => {
+                // Clicking the canvas takes keyboard focus, so Ctrl+Z and Delete
+                // act on the graph instead of on the composer.
+                try { rootRef.current?.focus({ preventScroll: true }) } catch {}
                 setEdgeMenu(null)
                 beginPan(event)
               },

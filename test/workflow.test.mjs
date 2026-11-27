@@ -7,10 +7,12 @@ import {
   applyComfyParams,
   buildSystemPrompt,
   comfyInputTargets,
+  comfyProgress,
   emptyWorkflow,
   getRun,
   graphFromApi,
   graphFromUi,
+  importWorkflow,
   loadComfyGraph,
   normalizeWorkflow,
   parseExchange,
@@ -649,4 +651,113 @@ test('startRun keeps node contexts isolated and routes exchange payloads', async
   assert.equal(logA.output, 'A-结果')
   const logC = JSON.parse(await readFile(join(root, 'dsh-workflows', 'session-test', 'runs', runId, 'nC.json'), 'utf8'))
   assert.match(JSON.stringify(logC.messages), /来自交换节点/)
+})
+test('each member gets its own dispatch brief from the leader', async () => {
+  resetWorkflowState()
+  const root = await mkdtemp(join(tmpdir(), 'dsh-aiwf-brief-'))
+  const requests = []
+  const llm = {
+    stream(options) {
+      requests.push(options)
+      return scriptedStream({ text: '完成' })
+    },
+  }
+  const ctx = {
+    get(name) {
+      if (name === 'sessions') {
+        return { get: () => ({ header: { cwd: root }, deriveMessages: () => [], append: () => ({ seq: 1 }) }) }
+      }
+      if (name === 'agents') return { get: () => undefined, turnBoundaryOf: () => ({ lastTurn: 1 }) }
+      if (name === 'llm') return llm
+      if (name === 'tools') return { schemas: () => [], execute: async () => ({ results: [], additionalContexts: [], concluded: false }) }
+      if (name === 'skills') return { list: async () => [], get: async () => undefined }
+      return undefined
+    },
+    effect() {},
+  }
+  const runId = await startRun(ctx, {
+    sessionId: 'session-brief',
+    workflow: {
+      id: 'main',
+      nodes: [
+        { id: 'L', type: 'leader', title: 'Leader', autoRead: false, value: '一起做这件任务', x: 0, y: 0 },
+        { id: 'a', type: 'model', title: '写手', provider: 'p', model: 'm', prompt: 'A的提示', dispatchHint: '只负责写文案，不要画图', x: 300, y: 0, tools: [], skills: [], mcps: [] },
+        { id: 'b', type: 'model', title: '画师', provider: 'p', model: 'm', prompt: 'B的提示', dispatchHint: '只负责配图，不要写文案', x: 600, y: 0, tools: [], skills: [], mcps: [] },
+      ],
+      edges: [
+        { id: 'e1', from: { node: 'L', port: 'out' }, to: { node: 'a', port: 'in' } },
+        { id: 'e2', from: { node: 'L', port: 'out' }, to: { node: 'b', port: 'in' } },
+        { id: 'e3', from: { node: 'a', port: 'out' }, to: { node: 'L', port: 'result' } },
+        { id: 'e4', from: { node: 'b', port: 'out' }, to: { node: 'L', port: 'result' } },
+      ],
+    },
+  })
+  const run = getRun(runId)
+  const deadline = Date.now() + 5000
+  while (run.status === 'running' && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20))
+  assert.equal(run.status, 'done', run.error)
+  // The brief rides in the system prompt; the task text rides in the message.
+  const first = String(requests[0].system)
+  const second = String(requests[1].system)
+  const firstMessage = JSON.stringify(requests[0].messages)
+  const secondMessage = JSON.stringify(requests[1].messages)
+  assert.match(first, /只负责写文案/)
+  assert.doesNotMatch(first, /只负责配图/)
+  assert.match(second, /只负责配图/)
+  assert.doesNotMatch(second, /只负责写文案/)
+  // Both still receive the leader's task text.
+  assert.match(firstMessage, /一起做这件任务/)
+  assert.match(secondMessage, /一起做这件任务/)
+})
+
+test('comfy progress reports the queue instead of a spinner', async () => {
+  const queue = {
+    queue_running: [[7, 'p1', { extra_pnginfo: { workflow: { nodes: [{ type: 'KSampler' }] } } }, {}, []]],
+    queue_pending: [[8, 'p2', {}, {}, []], [9, 'p3', {}, {}, []]],
+  }
+  const history = { h1: { status: { completed: true } }, h2: { status: { completed: true } } }
+  const fetchImpl = async (url) => ({
+    ok: true,
+    json: async () => (url.includes('/queue') ? queue : history),
+  })
+  const progress = await comfyProgress('http://127.0.0.1:8188', fetchImpl)
+  assert.equal(progress.ok, true)
+  assert.equal(progress.executing, true)
+  assert.equal(progress.running, 3)
+  assert.equal(progress.done, 2)
+  assert.equal(progress.total, 5)
+  assert.equal(progress.node, 'KSampler')
+
+  const offline = await comfyProgress('http://127.0.0.1:8188', async () => { throw new Error('ECONNREFUSED') })
+  assert.equal(offline.ok, false)
+  assert.match(offline.error, /ECONNREFUSED/)
+})
+
+test('a graph survives an export and import round trip', async () => {
+  resetWorkflowState()
+  const root = await mkdtemp(join(tmpdir(), 'dsh-aiwf-port-'))
+  const ctx = {
+    get(name) {
+      if (name === 'sessions') return { get: () => ({ header: { cwd: root } }) }
+      return undefined
+    },
+    effect() {},
+  }
+  const original = normalizeWorkflow({
+    id: 'main',
+    nodes: [
+      { id: 'i', type: 'input', title: '输入', x: 0, y: 0 },
+      { id: 'm', type: 'model', title: '成员', provider: 'p', model: 'm', prompt: '写点东西', dispatchHint: '只管文案', x: 260, y: 40 },
+    ],
+    edges: [{ id: 'e1', from: { node: 'i', port: 'out' }, to: { node: 'm', port: 'in' } }],
+  })
+  const response = await importWorkflow(ctx, 'session-port', original)
+  assert.equal(response.ok, true)
+  assert.equal(response.nodes, 2)
+  assert.equal(response.edges, 1)
+  const saved = JSON.parse(await readFile(join(root, 'dsh-workflows', 'session-port', 'main.json'), 'utf8'))
+  assert.equal(saved.nodes.length, 2)
+  assert.equal(saved.nodes[1].dispatchHint, '只管文案')
+  assert.equal(saved.edges.length, 1)
+  assert.equal(saved.nodes[1].x, 260)
 })
