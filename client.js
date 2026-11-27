@@ -111,6 +111,8 @@ window.__ModuleLoader__.load({
       "wfExpand": "Expand graph",
       "wfNoNegative": "This workflow has no negative-prompt input",
       "wfPreview": "Preview submit",
+      "wfAutoRun": "Auto-run",
+      "wfAutoRunHint": "Let this graph answer the conversation: each new message starts it and the chat agent stands aside until the reply is ready",
       "wfFit": "Fit",
       "wfFitHint": "Frame every node in the canvas",
       "wfUndo": "Undo",
@@ -219,6 +221,8 @@ window.__ModuleLoader__.load({
       "wfExpand": "展开节点图",
       "wfNoNegative": "该工作流没有负向提示词输入",
       "wfPreview": "预览提交",
+      "wfAutoRun": "自动运行",
+      "wfAutoRunHint": "让这张图代替对话作答：每条新消息都会驱动它，回复就绪前聊天代理不再抢答",
       "wfFit": "适应",
       "wfFitHint": "把整张图收进视野",
       "wfUndo": "撤销",
@@ -814,7 +818,10 @@ function clipToWidth(ctx, text, max) {
 .dsh-wf-edge-live{fill:none;stroke:var(--dsw-alias-brand-primary);stroke-width:2;stroke-dasharray:6 5}
 .dsh-wf-node{position:absolute;z-index:1;width:${WF_W}px;min-height:128px;border-radius:12px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);box-shadow:0 6px 18px rgba(0,0,0,.18);user-select:none}
 .dsh-wf-node.sel{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}
-.dsh-wf-node.running{border-color:var(--dsw-alias-state-success-primary)}
+.dsh-wf-node.running{border-color:#22c55e;box-shadow:0 0 0 2px rgba(34,197,94,.85),0 0 18px rgba(34,197,94,.35);animation:dsh-wf-pulse 1.4s ease-in-out infinite}
+.dsh-wf-node.done{border-color:rgba(34,197,94,.55);box-shadow:0 0 0 1px rgba(34,197,94,.35)}
+.dsh-wf-node.error{border-color:var(--dsw-alias-state-error-primary);box-shadow:0 0 0 2px rgba(239,68,68,.6)}
+@keyframes dsh-wf-pulse{0%,100%{box-shadow:0 0 0 2px rgba(34,197,94,.85),0 0 14px rgba(34,197,94,.25)}50%{box-shadow:0 0 0 3px rgba(34,197,94,1),0 0 24px rgba(34,197,94,.5)}}
 .dsh-wf-node.error{border-color:var(--dsw-alias-state-error-primary)}
 .dsh-wf-node-head{display:flex;align-items:center;gap:6px;padding:7px 10px;background:var(--dsw-alias-bg-layer-2);cursor:grab;border-radius:11px 11px 0 0}
 .dsh-wf-node-head:active{cursor:grabbing}
@@ -972,6 +979,12 @@ function clipToWidth(ctx, text, max) {
       const selectedRef = React.useRef('')
       selectedRef.current = selected
 
+      // Diagnostic handle: the Playwright checks and support both need a way to
+      // tell which conversation this pane is bound to.
+      if (typeof window !== 'undefined') {
+        window.__dshAiWorkflow = { sessionId, runId }
+      }
+
       // Load the graph once per session.
       React.useEffect(() => {
         let alive = true
@@ -1100,6 +1113,28 @@ function clipToWidth(ctx, text, max) {
         timer = setTimeout(tick, 250)
         return () => { cancelled = true; clearTimeout(timer) }
       }, [runId, t])
+
+      // Adopt runs this panel did not start (auto-run from the chat): the
+      // canvas still has to show which node is working.
+      React.useEffect(() => {
+        if (runId !== '' || sessionId === '') return undefined
+        let cancelled = false
+        const timer = setInterval(async () => {
+          try {
+            const data = await wfCall('run/active', { query: { sessionId } })
+            if (cancelled || data?.run === null || data?.run === undefined) return
+            setRun(data.run)
+            setWorkflow(current => (current === null ? current : wfApplyRun(current, data.run)), false)
+            if (data.run.status === 'running') setRunId(data.run.id)
+          } catch {
+            /* the panel simply keeps showing the last state */
+          }
+        }, 1500)
+        return () => {
+          cancelled = true
+          clearInterval(timer)
+        }
+      }, [runId, sessionId])
 
       // Wheel zoom must be non-passive to stop the page scrolling under it.
       React.useEffect(() => {
@@ -2046,7 +2081,7 @@ function clipToWidth(ctx, text, max) {
           'div',
           {
             key: node.id,
-            className: `dsh-wf-node ${selected === node.id ? 'sel' : ''} ${runtime === 'running' ? 'running' : runtime === 'error' ? 'error' : ''}`,
+            className: `dsh-wf-node ${selected === node.id ? 'sel' : ''} ${runtime === 'running' ? 'running' : runtime === 'error' ? 'error' : runtime === 'done' ? 'done' : ''}`,
             'data-node-id': node.id,
             style: { left: node.x, top: node.y, width: size.w, ...(expanded ? { height: size.h } : {}) },
             onPointerDown: event => beginDrag(event, node),
@@ -2388,6 +2423,15 @@ function clipToWidth(ctx, text, max) {
           h(Button, { label: t('wfExport'), title: t('wfExportHint'), onClick: () => void exportGraph() }),
           h(Button, { label: t('wfImport'), title: t('wfImportHint'), onClick: () => void importGraph() }),
           h('span', { className: 'dsh-wf-sp' }),
+          h(Button, {
+            label: `${t('wfAutoRun')} ${workflow?.autoRun === true ? 'ON' : 'OFF'}`,
+            title: t('wfAutoRunHint'),
+            tone: workflow?.autoRun === true ? 'primary' : 'plain',
+            onClick: () => {
+              if (workflow === null) return
+              setWorkflow({ ...workflow, autoRun: workflow.autoRun !== true })
+            },
+          }),
           h(Button, { label: running ? t('wfStop') : t('wfRun'), tone: running ? 'danger' : 'primary', disabled: workflow === null || nodes.length === 0 || sessionId === '', onClick: () => { void (running ? stopRun() : startRun()) } }),
           h(Button, { label: t('wfHelp'), title: t('wfHelpHint'), onClick: () => setNotice(t('wfHelpHint')) }),
           h('span', { className: 'dsh-wf-pill' }, saving ? t('wfSaving') : (notice || t('wfSaved'))),

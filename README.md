@@ -136,3 +136,17 @@ The brief is re-read on every run, like the node prompt.
 
 While a graph runs, the ComfyUI node polls the server's queue and shows
 `queue 3/7 · executing` with a progress bar instead of an endless spinner.
+### Node status colors
+
+A node wears its state on the card: a **pulsing green ring** while it runs, a
+thin green outline when it finished, red when it failed, so a long graph shows
+where the work is at a glance.
+
+### Auto-run (experimental)
+
+The **Auto-run** toggle makes a graph the responder for its conversation: a new
+chat message should start the graph and suppress the chat agent's own turn.
+The wiring is in place (`agent/inbox/inserted` / `session/event` listeners, a
+`run/active` route so the canvas adopts runs it did not start, and a pre-step
+rejection), but the trigger does not fire reliably on this build yet — treat it
+as experimental and use the **Run** button.

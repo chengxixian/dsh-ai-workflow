@@ -42,6 +42,24 @@ const COMFY_PORT = 8188
 /** Live runs, keyed by run id. Polled by the panel; small and short-lived. */
 const runs = new Map()
 
+/**
+ * Auto-run bookkeeping: which sessions currently have a workflow answering for
+ * them, so the chat's own agent turn can be rejected exactly once per message.
+ */
+const autoRuns = new Map()
+
+/**
+ * Is this graph set up to answer the conversation by itself?
+ * @param workflow - normalised graph.
+ * @returns true when auto-run is on and something can consume the message.
+ */
+export function shouldAutoRun(workflow) {
+  if (workflow === null || typeof workflow !== 'object') return false
+  if (workflow.autoRun !== true) return false
+  const nodes = Array.isArray(workflow.nodes) ? workflow.nodes : []
+  return nodes.some(node => node.type === 'input' || node.type === 'leader')
+}
+
 /** Last successful `/object_info` payload; also mirrored into the workspace. */
 let objectInfoCache = undefined
 
@@ -164,6 +182,7 @@ export function emptyWorkflow(title = 'AI 工作流') {
     version: 1,
     id: 'main',
     title,
+    autoRun: false,
     updated: new Date().toISOString(),
     nodes: [],
     edges: [],
@@ -254,6 +273,9 @@ export function normalizeWorkflow(input) {
     version: 1,
     id: safeId(source.id) ?? 'main',
     title: typeof source.title === 'string' ? source.title.slice(0, 120) : 'AI 工作流',
+    // Auto-run makes this graph the responder for the conversation: a new user
+    // message starts it and the chat agent's own turn is rejected.
+    autoRun: source.autoRun === true,
     updated: new Date().toISOString(),
     nodes,
     edges,
@@ -2063,6 +2085,7 @@ export function registerWorkflowRoutes(ctx) {
     { path: `${ROUTE_PREFIX}/catalog`, methods: ['GET'], fetch: (request) => serveCatalog(ctx, request) },
     { path: `${ROUTE_PREFIX}/run`, methods: ['POST'], fetch: (request) => serveRun(ctx, request) },
     { path: `${ROUTE_PREFIX}/run/status`, methods: ['GET'], fetch: (request) => serveRunStatus(ctx, request) },
+    { path: `${ROUTE_PREFIX}/run/active`, methods: ['GET'], fetch: (request) => serveRunActive(request) },
     { path: `${ROUTE_PREFIX}/run/cancel`, methods: ['POST'], fetch: (request) => serveRunCancel(ctx, request) },
     { path: `${ROUTE_PREFIX}/comfy/status`, methods: ['GET'], fetch: (request) => serveComfyStatus(ctx, request) },
     { path: `${ROUTE_PREFIX}/comfy/start`, methods: ['POST'], fetch: (request) => serveComfyStart(ctx, request) },
@@ -2084,6 +2107,48 @@ export function registerWorkflowRoutes(ctx) {
       () => ctx.connection.fetch.register({ path: route.path, methods: route.methods, requestBody: 'buffered', fetch: route.fetch }),
       `ai-workflow: route ${route.path}`,
     )
+  }
+
+  // Auto-run: a new user message in a session whose graph has `autoRun` starts
+  // the graph, and the chat agent's own turn is rejected so the graph is the one
+  // that answers. Both listeners are defensive: any failure leaves the normal
+  // chat behaviour untouched.
+  if (typeof ctx.on === 'function') {
+    ctx.on('agent/inbox/inserted', (payload) => {
+      const sessionId = String(payload?.agent?.id ?? '')
+      const message = payload?.message
+      if (sessionId === '' || message?.role !== 'user') return
+      // Never react to our own published replies.
+      if (message?.source?.provider === 'ai-workflow') return
+      void startAutoRun(ctx, sessionId).catch(() => undefined)
+    })
+
+    // Belt and braces: `session/event` is emitted for every append, not only for
+    // live agent inboxes, so a message typed while the graph tab is closed still
+    // wakes the graph.
+    ctx.on('session/event', (session, event) => {
+      const sessionId = String(session?.id ?? '')
+      if (sessionId === '') return
+      let text = ''
+      try {
+        text = JSON.stringify(event ?? {})
+      } catch {
+        return
+      }
+      if (!text.includes('"role":"user"')) return
+      if (text.includes('ai-workflow')) return
+      void startAutoRun(ctx, sessionId).catch(() => undefined)
+    })
+
+    ctx.on('agent/pre-step', (payload, next) => {
+      const sessionId = String(payload?.agent?.id ?? '')
+      if (sessionId !== '' && autoRuns.get(sessionId) !== undefined && payload?.step === 1) {
+        // The graph is answering this message; do not spend a model turn on it.
+        autoRuns.delete(sessionId)
+        return Promise.resolve({ kind: 'reject' })
+      }
+      return next()
+    })
   }
 
   // Dev-only bridge: the browser half is verified by a separate Playwright
@@ -2231,6 +2296,19 @@ async function serveComfyStatus(ctx, request) {
   const url = new URL(request.url, 'http://localhost')
   const baseUrl = url.searchParams.get('baseUrl') || `http://127.0.0.1:${COMFY_PORT}`
   return json({ ok: true, ...await comfyStatus(baseUrl) })
+}
+
+/**
+ * Newest run for one conversation, so the panel can paint nodes that were
+ * started by auto-run (not by its own Run button).
+ * @param request - GET with sessionId.
+ * @returns `{ ok, run }`.
+ */
+function serveRunActive(request) {
+  const url = new URL(request.url, 'http://localhost')
+  const sessionId = url.searchParams.get('sessionId') ?? ''
+  if (sessionId === '') return json({ ok: false, error: 'bad-session' }, 400)
+  return json({ ok: true, run: activeRunOf(sessionId) ?? null })
 }
 
 /**
@@ -2484,6 +2562,50 @@ export async function importWorkflow(ctx, sessionId, input) {
   await mkdir(folder.dir, { recursive: true })
   await writeFile(join(folder.dir, 'main.json'), JSON.stringify(workflow, null, 2), 'utf8')
   return { ok: true, workflow, nodes: workflow.nodes.length, edges: workflow.edges.length }
+}
+
+/**
+ * Start the saved graph because the user just sent a message.
+ * @param ctx - Host context.
+ * @param sessionId - conversation that received the message.
+ * @returns the run id, or undefined when auto-run does not apply.
+ */
+export async function startAutoRun(ctx, sessionId) {
+  if (runs.size > 0 && [...runs.values()].some(run => run.sessionId === sessionId && run.status === 'running')) return undefined
+  const folder = workflowDirOf(ctx, sessionId)
+  if (folder?.dir === undefined) return undefined
+  let workflow
+  try {
+    workflow = normalizeWorkflow(JSON.parse(await readFile(join(folder.dir, 'main.json'), 'utf8')))
+  } catch {
+    return undefined
+  }
+  if (!shouldAutoRun(workflow)) return undefined
+  autoRuns.set(sessionId, true)
+  // Tell the chat the graph is working: the agent turn is rejected, so without
+  // this the message would look ignored until the answer lands.
+  publishToChat(ctx, sessionId, '⏳ 工作流运行中…')
+  try {
+    return await startRun(ctx, { sessionId, workflow })
+  } catch (error) {
+    autoRuns.delete(sessionId)
+    publishToChat(ctx, sessionId, `工作流启动失败：${String(error?.message ?? error)}`)
+    return undefined
+  }
+}
+
+/**
+ * The newest run for one conversation, whoever started it.
+ * @param sessionId - conversation id.
+ * @returns the run view, or undefined.
+ */
+export function activeRunOf(sessionId) {
+  let newest
+  for (const run of runs.values()) {
+    if (run.sessionId !== sessionId) continue
+    if (newest === undefined || run.startedAt >= newest.startedAt) newest = run
+  }
+  return newest === undefined ? undefined : runView(newest)
 }
 
 /**

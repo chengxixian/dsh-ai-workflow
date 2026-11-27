@@ -17,7 +17,7 @@ export const name = 'dsh-ai-workflow'
  * Services this plugin needs before it can register its routes.
  * `connection` provides the authenticated fetch registry the routes hang off.
  */
-export const inject = ['connection']
+export const inject = ['connection', 'sessions', 'agents']
 
 /**
  * Register the `/api/ai-workflow` routes.

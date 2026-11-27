@@ -20,6 +20,7 @@ import {
   promptFields,
   publishToChat,
   resetWorkflowState,
+  shouldAutoRun,
   runModelNode,
   startRun,
   topoOrder,
@@ -760,4 +761,15 @@ test('a graph survives an export and import round trip', async () => {
   assert.equal(saved.nodes[1].dispatchHint, '只管文案')
   assert.equal(saved.edges.length, 1)
   assert.equal(saved.nodes[1].x, 260)
+})
+test('auto-run only when the graph opted in and has a consumer', () => {
+  const base = { id: 'main', title: 't', nodes: [{ id: 'i', type: 'input', title: '输入', x: 0, y: 0 }], edges: [] }
+  assert.equal(shouldAutoRun(normalizeWorkflow({ ...base, autoRun: false })), false)
+  assert.equal(shouldAutoRun(normalizeWorkflow({ ...base, autoRun: true })), true)
+  // Opted in but nothing can consume the message.
+  assert.equal(shouldAutoRun(normalizeWorkflow({ ...base, autoRun: true, nodes: [] })), false)
+  assert.equal(shouldAutoRun(normalizeWorkflow({ ...base, autoRun: true, nodes: [{ id: 'm', type: 'model', provider: 'p', model: 'm' }] })), false)
+  assert.equal(shouldAutoRun(null), false)
+  // The flag survives a round trip through the persisted shape.
+  assert.equal(normalizeWorkflow({ ...base, autoRun: true }).autoRun, true)
 })
