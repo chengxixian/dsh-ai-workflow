@@ -1,0 +1,5 @@
+# The AI-workflow canvas is its own bundle: it only needs the Web client so its
+# right-sidebar tab can mount, exactly like any other client plugin entry.
+- insert:
+    - id: ai-workflow
+      name: dsh-ai-workflow
